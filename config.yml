@@ -1,0 +1,14 @@
+# 🎮 Game Deployment Configuration
+# Place this file in your repository root
+
+# Game name displayed on the play page and documentation
+game_name: "My Awesome Game"
+
+# Godot Engine version (must match a barichello/godot-ci tag)
+# See: https://hub.docker.com/r/barichello/godot-ci/tags
+godot_version: "4.6"
+
+# Jekyll theme for documentation pages
+# Options: primer, slate, midnight, minimal, hacker, architect,
+#          cayman, dinky, modernist, leap-day, time-machine, merlot, tactile
+theme: "primer"

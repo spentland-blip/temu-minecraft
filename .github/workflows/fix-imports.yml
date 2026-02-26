@@ -1,0 +1,214 @@
+# 🔧 Godot Import Fixer Workflow
+# ═══════════════════════════════════════════════════════════════════════════════
+# When a zip exported from the Godot web editor is pushed to work_in_progress/,
+# this workflow unpacks it, runs `godot --headless --import` to generate the
+# .godot/imported directory, then re-zips and commits a *_fixed.zip back.
+#
+# Bot-authored commits do not trigger workflows, so pushing the fixed zip
+# will NOT cause an infinite loop.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: 🔧 Fix Godot Imports
+
+env:
+  DEFAULT_GODOT_VERSION: '4.5.2'
+  WORK_DIR: '/tmp/godot-fix'
+
+on:
+  push:
+    paths:
+      - 'work_in_progress/**.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fix-imports-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═════════════════════════════════════════════════════════════════════════
+  # 📖 Read Configuration (reuses the same config.yml pattern)
+  # ═════════════════════════════════════════════════════════════════════════
+  read-config:
+    name: 📖 Read Configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      godot_version: ${{ steps.config.outputs.godot_version }}
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: config.yml
+          sparse-checkout-cone-mode: false
+
+      - name: 📖 Parse config.yml
+        id: config
+        run: |
+          CONFIG_FILE="config.yml"
+
+          if [[ -f "$CONFIG_FILE" ]]; then
+            GODOT_VERSION=$(grep -E '^godot_version:' "$CONFIG_FILE" \
+              | sed 's/^godot_version:\s*//' \
+              | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | xargs)
+          fi
+
+          echo "godot_version=${GODOT_VERSION:-${{ env.DEFAULT_GODOT_VERSION }}}" >> "$GITHUB_OUTPUT"
+
+  # ═════════════════════════════════════════════════════════════════════════
+  # 🔧 Fix each new/changed zip in work_in_progress/
+  # ═════════════════════════════════════════════════════════════════════════
+  fix-imports:
+    name: 🔧 Fix Godot Imports
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: read-config
+    container:
+      image: barichello/godot-ci:${{ needs.read-config.outputs.godot_version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Need a token that can push; the default GITHUB_TOKEN works fine
+          # and commits made with it will NOT trigger further workflow runs.
+          token: ${{ github.token }}
+
+      - name: 🔍 Identify new zip files
+        id: find-zips
+        run: |
+          echo "🔍 Looking for zip files changed in this push..."
+
+          # List every .zip in work_in_progress/ that was added or modified
+          # in the commits of this push, excluding any _fixed.zip files.
+          CHANGED_ZIPS=""
+          for f in $(git diff --name-only --diff-filter=AM ${{ github.event.before }}..${{ github.sha }} \
+                     -- 'work_in_progress/*.zip' 2>/dev/null || \
+                     find work_in_progress -maxdepth 1 -name '*.zip' ! -name '*_fixed.zip' -type f); do
+            # Skip _fixed.zip files
+            if [[ "$f" == *_fixed.zip ]]; then
+              continue
+            fi
+            if [[ -f "$f" ]]; then
+              CHANGED_ZIPS="${CHANGED_ZIPS}${f}"$'\n'
+            fi
+          done
+
+          CHANGED_ZIPS=$(echo "$CHANGED_ZIPS" | sed '/^$/d' | sort -u)
+
+          if [[ -z "$CHANGED_ZIPS" ]]; then
+            echo "⚠️  No new zip files found to process."
+            echo "has_zips=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Found zip files to fix:"
+            echo "$CHANGED_ZIPS"
+            # Store as a newline-delimited list
+            EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+            echo "zip_list<<${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED_ZIPS" >> "$GITHUB_OUTPUT"
+            echo "${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+            echo "has_zips=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 🔧 Generate .godot imports and re-zip
+        if: steps.find-zips.outputs.has_zips == 'true'
+        run: |
+          set -euo pipefail
+
+          GODOT_VER="${{ needs.read-config.outputs.godot_version }}"
+          echo "🔧 Using Godot ${GODOT_VER}"
+          echo ""
+
+          # Process each zip
+          while IFS= read -r ZIP_FILE; do
+            [[ -z "$ZIP_FILE" ]] && continue
+
+            echo "═══════════════════════════════════════════"
+            echo "📦 Processing: $ZIP_FILE"
+            echo "═══════════════════════════════════════════"
+
+            BASENAME=$(basename "$ZIP_FILE" .zip)
+            EXTRACT_DIR="${{ env.WORK_DIR }}/${BASENAME}"
+            FIXED_ZIP="work_in_progress/${BASENAME}_fixed.zip"
+
+            # ── Clean up any previous run ──────────────────────────────
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+
+            # ── Validate ───────────────────────────────────────────────
+            echo "🔐 Validating archive..."
+            if ! unzip -t "$ZIP_FILE" > /dev/null 2>&1; then
+              echo "❌ $ZIP_FILE is not a valid zip — skipping"
+              continue
+            fi
+
+            if zipinfo -1 "$ZIP_FILE" | grep -qE '^\.\.|^/'; then
+              echo "❌ $ZIP_FILE contains suspicious paths — skipping"
+              continue
+            fi
+
+            # ── Extract ────────────────────────────────────────────────
+            echo "📦 Extracting..."
+            unzip -o "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+            # ── Locate project.godot ───────────────────────────────────
+            PROJECT_FILE=$(find "$EXTRACT_DIR" -name "project.godot" -type f | head -1)
+            if [[ -z "$PROJECT_FILE" ]]; then
+              echo "❌ No project.godot found in $ZIP_FILE — skipping"
+              continue
+            fi
+            PROJECT_ROOT=$(dirname "$PROJECT_FILE")
+            echo "✅ Project root: $PROJECT_ROOT"
+
+            # ── Run Godot import ───────────────────────────────────────
+            echo "⏳ Running godot --headless --import ..."
+            cd "$PROJECT_ROOT"
+            timeout 300 godot --headless --import 2>&1 || echo "Import phase completed"
+            cd -
+
+            # ── Verify .godot directory was created ────────────────────
+            if [[ ! -d "$PROJECT_ROOT/.godot" ]]; then
+              echo "❌ .godot directory was not created — skipping"
+              continue
+            fi
+            echo "✅ .godot directory created"
+            echo "   $(find "$PROJECT_ROOT/.godot" -type f | wc -l) imported files"
+
+            # ── Re-zip with imports included ───────────────────────────
+            echo "📦 Creating fixed zip: $FIXED_ZIP"
+
+            # Determine the top-level directory inside the extract dir so
+            # the zip structure mirrors the original.
+            cd "$EXTRACT_DIR"
+            zip -r "$GITHUB_WORKSPACE/$FIXED_ZIP" . -x '*.DS_Store' '__MACOSX/*'
+            cd "$GITHUB_WORKSPACE"
+
+            echo "✅ Created $FIXED_ZIP ($(du -h "$FIXED_ZIP" | cut -f1))"
+            echo ""
+
+          done <<< "${{ steps.find-zips.outputs.zip_list }}"
+
+      - name: 📤 Commit and push fixed zips
+        if: steps.find-zips.outputs.has_zips == 'true'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Check if there are any _fixed.zip files to commit
+          if ! ls work_in_progress/*_fixed.zip 1>/dev/null 2>&1; then
+            echo "⚠️  No fixed zips were produced — nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add work_in_progress/*_fixed.zip
+          git commit -m "🔧 Add import-fixed project zips [skip ci]"
+          git push
+          echo "✅ Pushed fixed zips to repository"

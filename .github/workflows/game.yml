@@ -1,0 +1,1229 @@
+# 🎮 Godot Game + GitHub Pages Deployment Workflow 🚀
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deploys your Godot game alongside documentation to GitHub Pages.
+#
+# Configuration: Create a config.yml in your repo root with:
+#   game_name: "My Game"
+#   godot_version: "4.3"
+#   theme: "primer"
+#
+# Compatibility: Godot 4.x, GitHub Free tier
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: 🎮 Deploy Game & Docs 📚
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎛️ CONFIGURATION - Defaults (overridden by config.yml if present)
+# ═══════════════════════════════════════════════════════════════════════════════
+env:
+  # ── Fallback Defaults (used if config.yml missing) ──────────────────────────
+  DEFAULT_THEME: 'primer'
+  DEFAULT_GAME_NAME: 'Play Game'
+  DEFAULT_GODOT_VERSION: '4.5.2'
+  
+  # ── Directory Paths ─────────────────────────────────────────────────────────
+  GAME_ZIP_PATH: 'publish'
+  DOCS_PATH: 'docs'
+  BUILD_DIR: '/tmp/game-project'
+  SITE_OUTPUT_DIR: '_combined_site'
+  EXPORT_NAME: 'game'
+  EXPORT_PRESET_NAME: 'Web'
+  
+  # ── Build Settings ──────────────────────────────────────────────────────────
+  ARTIFACT_RETENTION_DAYS: '1'
+  ARTIFACT_COMPRESSION_LEVEL: '6'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎛️ CONFIGURATION END
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - 'publish/**'
+      - 'config.yml'
+  workflow_dispatch:
+    # Manual trigger - rebuilds everything
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔒 PERMISSIONS - Minimal permissions at workflow level
+# ═══════════════════════════════════════════════════════════════════════════════
+permissions:
+  contents: read
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔄 CONCURRENCY - Cancel in-progress deployments when new push arrives
+# ═══════════════════════════════════════════════════════════════════════════════
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 📖 JOB 1: Read Configuration
+  # ═══════════════════════════════════════════════════════════════════════════
+  read-config:
+    name: 📖 Read Configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      game_name: ${{ steps.config.outputs.game_name }}
+      godot_version: ${{ steps.config.outputs.godot_version }}
+      theme: ${{ steps.config.outputs.theme }}
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: config.yml
+          sparse-checkout-cone-mode: false
+
+      - name: 📖 Parse config.yml
+        id: config
+        run: |
+          CONFIG_FILE="config.yml"
+          
+          if [[ -f "$CONFIG_FILE" ]]; then
+            echo "✅ Found config.yml, parsing..."
+            
+            # Parse YAML values (handles quoted and unquoted values)
+            GAME_NAME=$(grep -E '^game_name:' "$CONFIG_FILE" | sed 's/^game_name:\s*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | xargs)
+            GODOT_VERSION=$(grep -E '^godot_version:' "$CONFIG_FILE" | sed 's/^godot_version:\s*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | xargs)
+            THEME=$(grep -E '^theme:' "$CONFIG_FILE" | sed 's/^theme:\s*//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | xargs)
+            
+            echo "📋 Parsed values:"
+            echo "   game_name: ${GAME_NAME:-<not set>}"
+            echo "   godot_version: ${GODOT_VERSION:-<not set>}"
+            echo "   theme: ${THEME:-<not set>}"
+          else
+            echo "⚠️ No config.yml found, using defaults"
+          fi
+          
+          # Apply defaults for missing values
+          echo "game_name=${GAME_NAME:-${{ env.DEFAULT_GAME_NAME }}}" >> $GITHUB_OUTPUT
+          echo "godot_version=${GODOT_VERSION:-${{ env.DEFAULT_GODOT_VERSION }}}" >> $GITHUB_OUTPUT
+          echo "theme=${THEME:-${{ env.DEFAULT_THEME }}}" >> $GITHUB_OUTPUT
+
+      - name: 📊 Configuration Summary
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "         📖 CONFIGURATION SUMMARY          "
+          echo "═══════════════════════════════════════════"
+          echo "🎮 Game Name:      ${{ steps.config.outputs.game_name }}"
+          echo "🔧 Godot Version:  ${{ steps.config.outputs.godot_version }}"
+          echo "🎨 Theme:          ${{ steps.config.outputs.theme }}"
+          echo "═══════════════════════════════════════════"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🔍 JOB 2: Find Game Archive
+  # ═══════════════════════════════════════════════════════════════════════════
+  find-game:
+    name: 🎯 Find Game Archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: read-config
+    permissions:
+      contents: read
+    outputs:
+      latest_game_zip: ${{ steps.find-game.outputs.zip_file }}
+      has_game_zip: ${{ steps.find-game.outputs.has_zip }}
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0  # Full history needed for git log queries
+
+      - name: 🎯 Find Latest Game Archive
+        id: find-game
+        run: |
+          # Always find and build the most recent game zip in the repo,
+          # regardless of what triggered this workflow run
+          echo "🎯 Searching for game archives in ${{ env.GAME_ZIP_PATH }}/..."
+          
+          if [[ ! -d "${{ env.GAME_ZIP_PATH }}" ]]; then
+            echo "zip_file=" >> $GITHUB_OUTPUT
+            echo "has_zip=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Publish directory ${{ env.GAME_ZIP_PATH }}/ does not exist"
+            exit 0
+          fi
+          
+          # Find the most recently committed .zip file that still exists on disk
+          # (iterates through git history and picks first match that exists)
+          LATEST_ZIP=""
+          while IFS= read -r candidate; do
+            if [[ -n "$candidate" && -f "$candidate" ]]; then
+              LATEST_ZIP="$candidate"
+              break
+            fi
+          done < <(git log --all --pretty=format: --name-only | grep -E "^${{ env.GAME_ZIP_PATH }}/.*\.zip$" | awk '!seen[$0]++')
+          
+          if [[ -n "$LATEST_ZIP" ]]; then
+            echo "zip_file=$LATEST_ZIP" >> $GITHUB_OUTPUT
+            echo "has_zip=true" >> $GITHUB_OUTPUT
+            echo "✅ Found game archive: $LATEST_ZIP"
+            echo ""
+            echo "📦 Archive details:"
+            ls -lh "$LATEST_ZIP"
+            unzip -l "$LATEST_ZIP" | head -20
+          else
+            echo "zip_file=" >> $GITHUB_OUTPUT
+            echo "has_zip=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No game archives found in ${{ env.GAME_ZIP_PATH }}/"
+          fi
+
+      - name: 📊 Summary
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "            🎯 GAME ARCHIVE                "
+          echo "═══════════════════════════════════════════"
+          echo "📦 Game ZIP found:  ${{ steps.find-game.outputs.has_zip }}"
+          echo "📁 ZIP file:        ${{ steps.find-game.outputs.zip_file }}"
+          echo "🎮 Godot version:   ${{ needs.read-config.outputs.godot_version }}"
+          echo "═══════════════════════════════════════════"
+          echo ""
+          echo "ℹ️  Game will be built on every workflow run"
+          echo "    (not just when publish/ changes)"
+
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🎮 JOB 3: Build Godot Game for Web
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-game:
+    name: 🎮 Build Godot Game
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [read-config, find-game]
+    if: needs.find-game.outputs.has_game_zip == 'true'
+    permissions:
+      contents: read
+    container:
+      # Note: For maximum security, pin to a specific image digest:
+      # image: barichello/godot-ci@sha256:<digest>
+      # Find digests at: https://hub.docker.com/r/barichello/godot-ci/tags
+      image: barichello/godot-ci:${{ needs.read-config.outputs.godot_version }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      build_success: ${{ steps.verify-build.outputs.success }}
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          lfs: true
+
+      - name: 🔐 Validate ZIP Archive
+        id: validate-zip
+        run: |
+          ZIP_FILE="${{ needs.find-game.outputs.latest_game_zip }}"
+          echo "🔐 Validating archive: $ZIP_FILE"
+          
+          # Check file exists
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            echo "❌ ZIP file not found: $ZIP_FILE"
+            exit 1
+          fi
+          
+          # Test ZIP integrity
+          echo "Testing ZIP integrity..."
+          if ! unzip -t "$ZIP_FILE" > /dev/null 2>&1; then
+            echo "❌ ZIP file is corrupted or invalid"
+            exit 1
+          fi
+          echo "✅ ZIP integrity check passed"
+          
+          # Security: Check for path traversal attempts
+          echo "Checking for path traversal..."
+          if zipinfo -1 "$ZIP_FILE" | grep -qE '^\.\.|^/|\.\.'; then
+            echo "❌ ZIP contains potentially malicious paths (path traversal detected)"
+            exit 1
+          fi
+          echo "✅ Path traversal check passed"
+          
+          # Check for reasonable file count and size
+          FILE_COUNT=$(zipinfo -1 "$ZIP_FILE" | wc -l)
+          if [[ $FILE_COUNT -gt 10000 ]]; then
+            echo "⚠️ Warning: ZIP contains $FILE_COUNT files (unusually large)"
+          fi
+          echo "✅ Archive contains $FILE_COUNT files"
+
+      - name: 📦 Extract Game Project
+        run: |
+          echo "📦 Extracting game project..."
+          mkdir -p "${{ env.BUILD_DIR }}"
+          unzip -o "${{ needs.find-game.outputs.latest_game_zip }}" -d "${{ env.BUILD_DIR }}"
+          echo "✅ Game project extracted!"
+          echo ""
+          echo "📂 Project structure:"
+          find "${{ env.BUILD_DIR }}" -maxdepth 3 -type f | head -30
+
+      - name: 🔍 Locate Project Root
+        id: find-project
+        run: |
+          echo "🔍 Searching for project.godot..."
+          
+          PROJECT_FILE=$(find "${{ env.BUILD_DIR }}" -name "project.godot" -type f | head -1)
+          
+          if [[ -z "$PROJECT_FILE" ]]; then
+            echo "❌ Could not find project.godot in the archive!"
+            echo "Make sure your ZIP contains a valid Godot project."
+            exit 1
+          fi
+          
+          PROJECT_ROOT=$(dirname "$PROJECT_FILE")
+          echo "project_root=$PROJECT_ROOT" >> $GITHUB_OUTPUT
+          echo "✅ Found project at: $PROJECT_ROOT"
+
+      - name: 🔧 Setup Export Templates
+        run: |
+          GODOT_VER="${{ needs.read-config.outputs.godot_version }}"
+          echo "🔧 Setting up Godot export templates for version ${GODOT_VER}..."
+          
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/${GODOT_VER}.stable"
+          mkdir -p "$TEMPLATE_DIR"
+          mkdir -p "$HOME/.config/godot"
+          
+          # Move templates from container's root location
+          if [[ -d "/root/.local/share/godot/export_templates/${GODOT_VER}.stable" ]]; then
+            cp -r "/root/.local/share/godot/export_templates/${GODOT_VER}.stable/"* "$TEMPLATE_DIR/" 2>/dev/null || true
+          fi
+          
+          # Copy editor settings if they exist
+          if [[ -d "/root/.config/godot" ]]; then
+            cp -r "/root/.config/godot/"* "$HOME/.config/godot/" 2>/dev/null || true
+          fi
+          
+          echo "✅ Export templates ready!"
+          ls -la "$TEMPLATE_DIR" | head -10
+
+      - name: 📝 Create Web Export Preset (if needed)
+        run: |
+          cd "${{ steps.find-project.outputs.project_root }}"
+          
+          if [[ -f "export_presets.cfg" ]]; then
+            # Check if Web preset exists
+            if grep -q 'name="${{ env.EXPORT_PRESET_NAME }}"' export_presets.cfg; then
+              echo "✅ Using existing '${{ env.EXPORT_PRESET_NAME }}' export preset"
+              exit 0
+            fi
+            echo "⚠️ export_presets.cfg exists but no '${{ env.EXPORT_PRESET_NAME }}' preset found"
+            echo "Adding Web preset..."
+          fi
+          
+          echo "📝 Creating web export preset..."
+          cat > export_presets.cfg << 'PRESET_EOF'
+          [preset.0]
+
+          name="Web"
+          platform="Web"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/web/index.html"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          variant/extensions_support=false
+          vram_texture_compression/for_desktop=true
+          vram_texture_compression/for_mobile=false
+          html/export_icon=true
+          html/custom_html_shell=""
+          html/head_include=""
+          html/canvas_resize_policy=2
+          html/focus_canvas_on_start=true
+          html/experimental_virtual_keyboard=false
+          progressive_web_app/enabled=false
+          progressive_web_app/offline_page=""
+          progressive_web_app/display=1
+          progressive_web_app/orientation=0
+          progressive_web_app/icon_144x144=""
+          progressive_web_app/icon_180x180=""
+          progressive_web_app/icon_512x512=""
+          progressive_web_app/background_color=Color(0, 0, 0, 1)
+          PRESET_EOF
+          
+          echo "✅ Export preset created!"
+
+      - name: 🏗️ Build Web Export
+        id: godot-export
+        run: |
+          cd "${{ steps.find-project.outputs.project_root }}"
+          
+          # Create output directory
+          mkdir -p build/web
+          
+          GODOT_VER="${{ needs.read-config.outputs.godot_version }}"
+          echo "🏗️ Building game for web with Godot ${GODOT_VER}..."
+          echo "═══════════════════════════════════════════"
+          
+          # First, import the project to generate .godot/imported files
+          echo "📦 Importing project resources..."
+          timeout 300 godot --headless --import 2>&1 || echo "Import phase completed"
+          
+          # Now export
+          echo ""
+          echo "🎮 Exporting to Web..."
+          EXPORT_OUTPUT=$(godot --headless --verbose --export-release "${{ env.EXPORT_PRESET_NAME }}" "build/web/index.html" 2>&1) || true
+          
+          echo "$EXPORT_OUTPUT"
+          
+          # Check for critical errors (not just warnings)
+          if echo "$EXPORT_OUTPUT" | grep -qiE "SCRIPT ERROR|FATAL|Cannot export"; then
+            echo ""
+            echo "❌ Export failed with critical errors"
+            exit 1
+          fi
+          
+          echo ""
+          echo "═══════════════════════════════════════════"
+
+      - name: ✅ Verify Build Output
+        id: verify-build
+        run: |
+          cd "${{ steps.find-project.outputs.project_root }}"
+          
+          if [[ -f "build/web/index.html" ]]; then
+            echo "✅ Game build successful!"
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo ""
+            echo "📂 Build output:"
+            ls -lah build/web/
+            
+            # Check for essential files
+            for file in index.html index.js index.wasm index.pck; do
+              if [[ -f "build/web/$file" ]]; then
+                echo "  ✅ $file"
+              else
+                echo "  ⚠️ $file (missing - may be optional)"
+              fi
+            done
+          else
+            echo "❌ Build failed - index.html not created"
+            echo "success=false" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "Creating placeholder page for failed build..."
+            mkdir -p build/web
+            cat > build/web/index.html << 'PLACEHOLDER_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Build Failed</title>
+            <style>
+              body { 
+                background: #1a1a2e; color: #eee; font-family: system-ui, sans-serif;
+                display: flex; align-items: center; justify-content: center;
+                height: 100vh; margin: 0; text-align: center;
+              }
+              .container { max-width: 500px; padding: 2rem; }
+              h1 { color: #ff6b6b; }
+              code { background: #333; padding: 0.2em 0.5em; border-radius: 4px; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>🔧 Game Build Failed</h1>
+              <p>The Godot export encountered an issue.</p>
+              <p>Check the <a href="https://github.com" style="color:#00d9ff">workflow logs</a> for details.</p>
+              <p style="margin-top:2rem;color:#888">
+                Common issues:<br>
+                • Missing <code>project.godot</code><br>
+                • Incompatible Godot version<br>
+                • Export preset misconfiguration
+              </p>
+            </div>
+          </body>
+          </html>
+          PLACEHOLDER_EOF
+          fi
+
+      - name: 📤 Upload Game Artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: godot-game-web
+          path: ${{ steps.find-project.outputs.project_root }}/build/web/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: ${{ env.ARTIFACT_COMPRESSION_LEVEL }}
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 📚 JOB 4: Build Documentation Site
+  # ═══════════════════════════════════════════════════════════════════════════
+  build-docs:
+    name: 📚 Build Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [read-config, find-game]
+    permissions:
+      contents: read
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: 💎 Setup Ruby
+        uses: ruby/setup-ruby@13e7a03dc3ac6c3798f4570bfead2aed4d96abfb # v1.244.0
+        with:
+          ruby-version: '3.2'
+
+      - name: 📝 Prepare Jekyll Site
+        run: |
+          echo "📝 Preparing Jekyll site from ${{ env.DOCS_PATH }}/..."
+          mkdir -p _site_source
+          
+          if [[ -d "${{ env.DOCS_PATH }}" ]]; then
+            cp -r "${{ env.DOCS_PATH }}"/* _site_source/
+            echo "✅ Documentation copied!"
+          else
+            echo "⚠️ No ${{ env.DOCS_PATH }}/ directory found, creating placeholder..."
+            cat > _site_source/index.md << 'INDEX_EOF'
+          # Welcome! 🎮
+
+          Your game documentation will appear here.
+
+          Add markdown files to the `docs/` directory to build your documentation.
+
+          [Play the Game →](play.html)
+          INDEX_EOF
+          fi
+          
+          # Ensure index exists
+          if [[ ! -f "_site_source/index.md" && ! -f "_site_source/README.md" && ! -f "_site_source/index.html" ]]; then
+            FIRST_MD=$(find _site_source -name "*.md" -type f | head -1)
+            if [[ -n "$FIRST_MD" ]]; then
+              cp "$FIRST_MD" _site_source/index.md
+            else
+              echo "# Welcome! 🎮" > _site_source/index.md
+            fi
+          fi
+          
+          echo "📂 Site source contents:"
+          ls -la _site_source/
+
+      - name: 🎨 Configure Jekyll Theme
+        env:
+          THEME: ${{ needs.read-config.outputs.theme }}
+          GAME_NAME: ${{ needs.read-config.outputs.game_name }}
+        run: |
+          echo "🎨 Applying theme: $THEME"
+          
+          cat > _site_source/_config.yml << CONFIG_EOF
+          # 🎮 Game Documentation Site
+          # Auto-generated by deploy-game.yml workflow
+          # Theme: ${THEME}
+
+          remote_theme: pages-themes/${THEME}
+
+          plugins:
+            - jekyll-remote-theme
+
+          title: ${GAME_NAME} - Documentation
+          description: Game documentation and playable demo
+          baseurl: /${{ github.event.repository.name }}
+
+          # Exclude workflow files from processing
+          exclude:
+            - Gemfile
+            - Gemfile.lock
+            - vendor
+
+          # Custom settings
+          show_downloads: false
+          CONFIG_EOF
+          
+          echo "✅ Jekyll config created!"
+
+      - name: 💎 Create Gemfile
+        run: |
+          cat > _site_source/Gemfile << 'GEMFILE_EOF'
+          source "https://rubygems.org"
+
+          gem "github-pages", "~> 232", group: :jekyll_plugins
+          gem "jekyll-remote-theme", "~> 0.4"
+          gem "webrick", "~> 1.8"  # Required for Ruby 3+
+          GEMFILE_EOF
+          
+          # Create Gemfile.lock for reproducible builds and caching
+          cd _site_source
+          bundle lock --add-platform x86_64-linux
+          echo "✅ Gemfile and Gemfile.lock created!"
+
+      - name: 📦 Install Dependencies
+        run: |
+          cd _site_source
+          bundle config set --local path 'vendor/bundle'
+          bundle install --jobs 4 --retry 3
+          echo "✅ Dependencies installed!"
+
+      - name: 🏗️ Build Jekyll Site
+        run: |
+          cd _site_source
+          echo "🏗️ Building Jekyll site..."
+          bundle exec jekyll build --destination ../_site --trace
+          echo "✅ Jekyll build complete!"
+          echo ""
+          echo "📂 Built site:"
+          ls -la ../_site/
+
+      - name: 📤 Upload Docs Artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jekyll-docs
+          path: _site/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          compression-level: ${{ env.ARTIFACT_COMPRESSION_LEVEL }}
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🔨 JOB 5: Combine Game and Documentation
+  # ═══════════════════════════════════════════════════════════════════════════
+  combine-site:
+    name: 🔨 Combine Game & Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [read-config, find-game, build-game, build-docs]
+    # Run if docs built successfully; game is optional
+    # Note: This means the site deploys even if game build fails
+    if: always() && needs.build-docs.result == 'success'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: 📥 Download Docs Artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jekyll-docs
+          path: ${{ env.SITE_OUTPUT_DIR }}/
+
+      - name: 📥 Download Game Artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: godot-game-web
+          path: ${{ env.SITE_OUTPUT_DIR }}/game/
+        continue-on-error: true  # Game build is optional
+
+      - name: 🔒 Add Cross-Origin Isolation Service Worker
+        run: |
+          SITE_DIR="${{ env.SITE_OUTPUT_DIR }}"
+          GAME_DIR="${{ env.SITE_OUTPUT_DIR }}/game"
+          
+          echo "🔒 Adding coi-serviceworker for SharedArrayBuffer support..."
+          
+          # Download to site root (for play.html)
+          curl -fsSL -o "$SITE_DIR/coi-serviceworker.js" \
+            "https://unpkg.com/coi-serviceworker@0.1.7/coi-serviceworker.min.js"
+          
+          if [[ ! -f "$SITE_DIR/coi-serviceworker.js" ]]; then
+            echo "❌ Failed to download coi-serviceworker.js"
+            exit 1
+          fi
+          
+          echo "✅ Downloaded coi-serviceworker.js to site root"
+          
+          # Also copy to game directory if it exists
+          if [[ -d "$GAME_DIR" ]]; then
+            cp "$SITE_DIR/coi-serviceworker.js" "$GAME_DIR/coi-serviceworker.js"
+            echo "✅ Copied coi-serviceworker.js to game directory"
+            
+            # Inject into game index.html
+            if [[ -f "$GAME_DIR/index.html" ]] && grep -q "<head>" "$GAME_DIR/index.html"; then
+              sed -i 's|<head>|<head>\n\t<script src="coi-serviceworker.js"></script>|' "$GAME_DIR/index.html"
+              echo "✅ Injected coi-serviceworker into game index.html"
+            fi
+          else
+            echo "⚠️ No game directory found, skipping game-specific COI setup"
+          fi
+
+      - name: 🎮 Create Game Embed Page
+        env:
+          PAGE_TITLE: ${{ needs.read-config.outputs.game_name }}
+        run: |
+          echo "🎮 Creating game embed page..."
+          
+          # Check if game files exist
+          if [[ -f "${{ env.SITE_OUTPUT_DIR }}/game/index.html" ]]; then
+            GAME_EXISTS="true"
+            echo "✅ Game build found!"
+          else
+            GAME_EXISTS="false"
+            echo "⚠️ No game build found, page will show placeholder"
+            mkdir -p "${{ env.SITE_OUTPUT_DIR }}/game"
+          fi
+          
+          # Create the play page with COI service worker in head
+          cat > "${{ env.SITE_OUTPUT_DIR }}/play.html" << 'PLAYPAGE_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <script src="coi-serviceworker.js"></script>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>🎮 GAME_TITLE_PLACEHOLDER</title>
+            <meta name="description" content="Play the game directly in your browser">
+            <style>
+              *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+              
+              body {
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                min-height: 100vh;
+                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+                color: #e8e8e8;
+                display: flex;
+                flex-direction: column;
+              }
+              
+              header {
+                padding: 1rem 2rem;
+                background: rgba(0, 0, 0, 0.3);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 1rem;
+              }
+              
+              header h1 {
+                font-size: 1.5rem;
+                background: linear-gradient(90deg, #00d9ff, #00ff88);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+              }
+              
+              header a {
+                color: #00d9ff;
+                text-decoration: none;
+                padding: 0.5rem 1rem;
+                border: 1px solid #00d9ff;
+                border-radius: 4px;
+                transition: all 0.3s ease;
+              }
+              
+              header a:hover, header a:focus {
+                background: #00d9ff;
+                color: #1a1a2e;
+                outline: none;
+              }
+              
+              main {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 2rem;
+              }
+              
+              #game-container {
+                width: 100%;
+                max-width: 1280px;
+                aspect-ratio: 16/9;
+                background: #000;
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: 0 20px 60px rgba(0, 217, 255, 0.2);
+                position: relative;
+              }
+              
+              #game-container iframe {
+                width: 100%;
+                height: 100%;
+                border: none;
+              }
+              
+              #start-overlay {
+                position: absolute;
+                inset: 0;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                transition: opacity 0.5s ease;
+              }
+              
+              #start-overlay.hidden {
+                opacity: 0;
+                pointer-events: none;
+              }
+              
+              .game-icon {
+                font-size: 5rem;
+                margin-bottom: 2rem;
+                animation: pulse 2s ease-in-out infinite;
+              }
+              
+              @keyframes pulse {
+                0%, 100% { transform: scale(1); }
+                50% { transform: scale(1.1); }
+              }
+              
+              #start-btn {
+                font-size: 1.5rem;
+                padding: 1rem 3rem;
+                background: linear-gradient(90deg, #00d9ff, #00ff88);
+                border: none;
+                border-radius: 50px;
+                color: #1a1a2e;
+                font-weight: bold;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                box-shadow: 0 10px 30px rgba(0, 217, 255, 0.4);
+              }
+              
+              #start-btn:hover, #start-btn:focus {
+                transform: translateY(-3px);
+                box-shadow: 0 15px 40px rgba(0, 217, 255, 0.5);
+                outline: none;
+              }
+              
+              #start-btn:active { transform: translateY(0); }
+              
+              #start-btn:disabled {
+                background: #666;
+                cursor: not-allowed;
+                transform: none;
+                box-shadow: none;
+              }
+              
+              .start-hint {
+                margin-top: 1.5rem;
+                color: #888;
+                font-size: 0.9rem;
+              }
+              
+              #loading {
+                display: none;
+                flex-direction: column;
+                align-items: center;
+              }
+              
+              .spinner {
+                width: 50px;
+                height: 50px;
+                border: 4px solid #333;
+                border-top-color: #00d9ff;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+              }
+              
+              @keyframes spin { to { transform: rotate(360deg); } }
+              
+              #fullscreen-btn {
+                position: absolute;
+                bottom: 1rem;
+                right: 1rem;
+                background: rgba(0, 0, 0, 0.7);
+                border: 1px solid #00d9ff;
+                color: #00d9ff;
+                padding: 0.5rem 1rem;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 0.9rem;
+                z-index: 10;
+                opacity: 0;
+                transition: opacity 0.3s ease;
+              }
+              
+              #game-container:hover #fullscreen-btn,
+              #fullscreen-btn:focus {
+                opacity: 1;
+              }
+              
+              #fullscreen-btn:hover {
+                background: #00d9ff;
+                color: #1a1a2e;
+              }
+              
+              .no-game {
+                text-align: center;
+                padding: 3rem;
+              }
+              
+              .no-game h2 { color: #ff6b6b; margin-bottom: 1rem; }
+              
+              footer {
+                padding: 1rem;
+                text-align: center;
+                color: #666;
+                font-size: 0.8rem;
+              }
+              
+              footer a { color: #888; }
+              
+              /* Info banner for COI status */
+              .coi-info {
+                background: #1e2a1e;
+                border: 1px solid #00aa00;
+                color: #88cc88;
+                padding: 0.75rem 1rem;
+                margin: 0 2rem 1rem;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                text-align: center;
+                display: none;
+              }
+              
+              .coi-info.warning {
+                background: #2a2a1e;
+                border-color: #aaaa00;
+                color: #cccc88;
+              }
+              
+              .coi-info.error {
+                background: #2a1e1e;
+                border-color: #aa0000;
+                color: #cc8888;
+              }
+              
+              @media (max-width: 768px) {
+                header { padding: 1rem; }
+                main { padding: 1rem; }
+                .game-icon { font-size: 4rem; }
+                #start-btn { font-size: 1.2rem; padding: 0.8rem 2rem; }
+              }
+            </style>
+          </head>
+          <body>
+            <header>
+              <h1>🎮 GAME_TITLE_PLACEHOLDER</h1>
+              <a href="index.html">📚 Documentation</a>
+            </header>
+            
+            <div class="coi-info" id="coi-info"></div>
+            
+            <main>
+              <div id="game-container">
+                <div id="start-overlay">
+                  <div class="game-icon">🎮</div>
+                  <button id="start-btn">▶️ START GAME</button>
+                  <p class="start-hint" id="start-hint">Click to load and play the game</p>
+                  <div id="loading">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 1rem;">Loading game...</p>
+                  </div>
+                </div>
+                <iframe id="game-frame" style="display: none;" title="Game" allow="cross-origin-isolated"></iframe>
+                <button id="fullscreen-btn" style="display: none;" aria-label="Toggle fullscreen">⛶ Fullscreen</button>
+              </div>
+            </main>
+            
+            <footer>
+              Built with 💜 using <a href="https://github.com/features/actions">GitHub Actions</a> • 
+              <a href="https://godotengine.org">Godot Engine</a> • 
+              <a href="https://jekyllrb.com">Jekyll</a>
+            </footer>
+            
+            <script>
+              (function() {
+                'use strict';
+                
+                var startBtn = document.getElementById('start-btn');
+                var startOverlay = document.getElementById('start-overlay');
+                var startHint = document.getElementById('start-hint');
+                var loading = document.getElementById('loading');
+                var gameFrame = document.getElementById('game-frame');
+                var fullscreenBtn = document.getElementById('fullscreen-btn');
+                var gameContainer = document.getElementById('game-container');
+                var coiInfo = document.getElementById('coi-info');
+                var gameIcon = document.querySelector('.game-icon');
+                
+                var gameExists = true;
+                var isolationReady = false;
+                var waitingForIsolation = false;
+                
+                // Check if game files exist
+                fetch('game/index.html', { method: 'HEAD' })
+                  .then(function(response) {
+                    if (!response.ok) {
+                      gameExists = false;
+                      showNoGame();
+                    }
+                  })
+                  .catch(function() {
+                    gameExists = false;
+                    showNoGame();
+                  });
+                
+                function showNoGame() {
+                  startOverlay.innerHTML = 
+                    '<div class="no-game">' +
+                      '<div class="game-icon">🚧</div>' +
+                      '<h2>Game Not Available</h2>' +
+                      '<p>The game build is not available yet.</p>' +
+                      '<p style="margin-top: 1rem; color: #888;">Upload a Godot project zip to the publish/ directory to enable this feature.</p>' +
+                    '</div>';
+                }
+                
+                function showCoiMessage(message, type) {
+                  coiInfo.textContent = message;
+                  coiInfo.className = 'coi-info' + (type ? ' ' + type : '');
+                  coiInfo.style.display = 'block';
+                }
+                
+                function checkIsolation() {
+                  if (window.crossOriginIsolated) {
+                    isolationReady = true;
+                    coiInfo.style.display = 'none';
+                    return true;
+                  }
+                  return false;
+                }
+                
+                function loadGame() {
+                  if (!gameExists) return;
+                  
+                  startBtn.style.display = 'none';
+                  if (startHint) startHint.style.display = 'none';
+                  if (gameIcon) gameIcon.style.display = 'none';
+                  loading.style.display = 'flex';
+                  
+                  gameFrame.src = 'game/index.html';
+                  gameFrame.onload = function() {
+                    startOverlay.classList.add('hidden');
+                    gameFrame.style.display = 'block';
+                    fullscreenBtn.style.display = 'block';
+                  };
+                  gameFrame.onerror = function() {
+                    loading.innerHTML = '<p style="color: #ff6b6b;">Failed to load game</p>';
+                  };
+                }
+                
+                // Check isolation status on load
+                if (checkIsolation()) {
+                  // Already isolated, ready to go
+                  console.log('Cross-origin isolation active');
+                } else {
+                  // Not isolated yet - service worker should reload us
+                  // Show a brief message
+                  showCoiMessage('⏳ Setting up game environment...', '');
+                  
+                  // The coi-serviceworker will reload the page automatically
+                  // Set a timeout to detect if it's not working
+                  setTimeout(function() {
+                    if (!checkIsolation()) {
+                      showCoiMessage('⏳ First visit - page will reload automatically to enable game features...', 'warning');
+                      
+                      // Give it more time, then show error
+                      setTimeout(function() {
+                        if (!checkIsolation()) {
+                          showCoiMessage('⚠️ Could not enable all game features. The game may still work, but with reduced performance. Try refreshing.', 'error');
+                          // Allow them to try anyway
+                          isolationReady = true;
+                        }
+                      }, 5000);
+                    }
+                  }, 1500);
+                }
+                
+                if (startBtn) {
+                  startBtn.addEventListener('click', function() {
+                    if (!gameExists) return;
+                    
+                    // Check isolation before loading
+                    if (!checkIsolation() && !isolationReady) {
+                      // Not ready yet, disable button and wait
+                      startBtn.disabled = true;
+                      startBtn.textContent = '⏳ Please wait...';
+                      waitingForIsolation = true;
+                      
+                      showCoiMessage('⏳ Waiting for game environment setup... page should reload shortly.', 'warning');
+                      
+                      // Check periodically
+                      var checkCount = 0;
+                      var checkInterval = setInterval(function() {
+                        checkCount++;
+                        if (checkIsolation() || checkCount > 10) {
+                          clearInterval(checkInterval);
+                          startBtn.disabled = false;
+                          startBtn.textContent = '▶️ START GAME';
+                          waitingForIsolation = false;
+                          
+                          if (checkIsolation()) {
+                            loadGame();
+                          } else {
+                            showCoiMessage('⚠️ Game features limited. Try refreshing the page, or click Start to try anyway.', 'error');
+                            isolationReady = true; // Allow them to try
+                          }
+                        }
+                      }, 500);
+                      
+                      return;
+                    }
+                    
+                    loadGame();
+                  });
+                }
+                
+                if (fullscreenBtn) {
+                  fullscreenBtn.addEventListener('click', function() {
+                    if (gameContainer.requestFullscreen) {
+                      gameContainer.requestFullscreen();
+                    } else if (gameContainer.webkitRequestFullscreen) {
+                      gameContainer.webkitRequestFullscreen();
+                    } else if (gameContainer.msRequestFullscreen) {
+                      gameContainer.msRequestFullscreen();
+                    }
+                  });
+                }
+              })();
+            </script>
+          </body>
+          </html>
+          PLAYPAGE_EOF
+          
+          # Replace placeholder with actual game title
+          sed -i "s/GAME_TITLE_PLACEHOLDER/${PAGE_TITLE}/g" "${{ env.SITE_OUTPUT_DIR }}/play.html"
+          
+          echo "✅ Game page created with COI service worker!"
+
+      - name: 🔗 Add Game Link to Documentation
+        run: |
+          echo "🔗 Ensuring game link exists in documentation..."
+          
+          # If there's an index.html without a play link, try to add one
+          INDEX_FILE="${{ env.SITE_OUTPUT_DIR }}/index.html"
+          if [[ -f "$INDEX_FILE" ]]; then
+            if ! grep -q "play.html" "$INDEX_FILE"; then
+              # Try to insert after </header> or at start of <body>
+              if grep -q "</header>" "$INDEX_FILE"; then
+                sed -i 's|</header>|</header>\n<div style="background:linear-gradient(90deg,#00d9ff,#00ff88);padding:1rem;text-align:center;"><a href="play.html" style="color:#1a1a2e;text-decoration:none;font-weight:bold;font-size:1.2rem;">🎮 PLAY THE GAME →</a></div>|' "$INDEX_FILE"
+                echo "✅ Play link added to index.html"
+              fi
+            else
+              echo "✅ Play link already exists"
+            fi
+          fi
+
+      - name: 📊 Generate Build Summary
+        run: |
+          # Create GitHub Actions job summary
+          {
+            echo "## 🎮 Build Summary"
+            echo ""
+            echo "| Component | Status |"
+            echo "|-----------|--------|"
+            
+            if [[ -f "${{ env.SITE_OUTPUT_DIR }}/game/index.html" ]]; then
+              echo "| Game Build | ✅ Success |"
+              if [[ -f "${{ env.SITE_OUTPUT_DIR }}/game/coi-serviceworker.js" ]]; then
+                echo "| COI Service Worker (game) | ✅ Installed |"
+              else
+                echo "| COI Service Worker (game) | ⚠️ Missing |"
+              fi
+            else
+              echo "| Game Build | ⚠️ Skipped/Failed |"
+            fi
+            
+            if [[ -f "${{ env.SITE_OUTPUT_DIR }}/coi-serviceworker.js" ]]; then
+              echo "| COI Service Worker (root) | ✅ Installed |"
+            else
+              echo "| COI Service Worker (root) | ⚠️ Missing |"
+            fi
+            
+            if [[ -f "${{ env.SITE_OUTPUT_DIR }}/index.html" ]]; then
+              echo "| Documentation | ✅ Success |"
+            else
+              echo "| Documentation | ❌ Failed |"
+            fi
+            
+            echo ""
+            echo "### 📖 Configuration"
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Game Name | ${{ needs.read-config.outputs.game_name }} |"
+            echo "| Godot Version | ${{ needs.read-config.outputs.godot_version }} |"
+            echo "| Theme | ${{ needs.read-config.outputs.theme }} |"
+            echo ""
+            echo "### 📂 Site Contents"
+            echo "\`\`\`"
+            find "${{ env.SITE_OUTPUT_DIR }}" -type f | head -30
+            echo "\`\`\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 📂 Final Site Structure
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════"
+          echo "        📂 FINAL SITE STRUCTURE            "
+          echo "═══════════════════════════════════════════"
+          find "${{ env.SITE_OUTPUT_DIR }}" -type f | head -50
+          echo ""
+          echo "Total files: $(find "${{ env.SITE_OUTPUT_DIR }}" -type f | wc -l)"
+          echo "Total size: $(du -sh "${{ env.SITE_OUTPUT_DIR }}" | cut -f1)"
+          echo "═══════════════════════════════════════════"
+
+      - name: 📤 Upload Combined Site
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: ${{ env.SITE_OUTPUT_DIR }}/
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🚀 JOB 6: Deploy to GitHub Pages
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: 🚀 Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: combine-site
+    if: always() && needs.combine-site.result == 'success'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+
+      - name: 📊 Deployment Summary
+        run: |
+          PAGE_URL="${{ steps.deployment.outputs.page_url }}"
+          
+          {
+            echo "## 🚀 Deployment Complete!"
+            echo ""
+            echo "Your site is now live at:"
+            echo ""
+            echo "| Page | URL |"
+            echo "|------|-----|"
+            echo "| 📚 Documentation | [${PAGE_URL}](${PAGE_URL}) |"
+            echo "| 🎮 Play Game | [${PAGE_URL}play.html](${PAGE_URL}play.html) |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "*Deployed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 🎉 Deployment Complete
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
+          echo ""
+          echo "   🎉 DEPLOYMENT SUCCESSFUL! 🎉"
+          echo ""
+          echo "   🌐 Your site is live at:"
+          echo "   ${{ steps.deployment.outputs.page_url }}"
+          echo ""
+          echo "   📚 Documentation: ${{ steps.deployment.outputs.page_url }}"
+          echo "   🎮 Play Game: ${{ steps.deployment.outputs.page_url }}play.html"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
